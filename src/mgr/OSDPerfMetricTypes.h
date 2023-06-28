@@ -6,6 +6,7 @@
 
 #include "include/denc.h"
 #include "include/stringify.h"
+#include "common/Formatter.h"
 
 #include "mgr/Types.h"
 
