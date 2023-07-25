@@ -108,6 +108,14 @@ void Capability::Import::dump(ceph::Formatter *f) const
   f->dump_unsigned("migrate_seq", mseq);
 }
 
+void Capability::Import::generate_test_instances(std::list<Capability::Import*>& ls)
+{
+  ls.push_back(new Import);
+  ls.push_back(new Import);
+  ls.back()->cap_id = 1;
+  ls.back()->issue_seq = 2;
+  ls.back()->mseq = 3;
+}
 /*
  * Capability::revoke_info
  */
