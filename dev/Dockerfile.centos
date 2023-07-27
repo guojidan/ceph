@@ -1,0 +1,33 @@
+ARG CENTOS_TAG=stream8
+FROM quay.io/centos/centos:${CENTOS_TAG}
+
+WORKDIR /ceph
+
+ENV DNF_INSTALL_OPTIONS="\
+    --setopt=fastestmirror=true \
+#    --setopt=keepcache=true \
+    --nodocs \
+    "
+
+# Install EPEL (https://www.redhat.com/sysadmin/install-epel-linux)
+RUN dnf install -y ${DNF_INSTALL_OPTIONS} \
+      epel-release \
+      epel-next-release
+
+ENV LANG=C.UTF-8
+
+ENV DNF_PACKAGES="\
+    dnf-command(config-manager) \
+    dnf-command(builddep) \
+    ccache \
+    git-core \
+#    which \
+#    clang \
+#    curl-minimal \
+    "
+RUN dnf install -y ${DNF_INSTALL_OPTIONS} ${DNF_PACKAGES}
+RUN dnf config-manager --set-enabled powertools
+
+COPY ceph.spec.in .
+RUN sed -e 's/@//g' ceph.spec.in > ceph.spec
+RUN dnf builddep -y ${DNF_INSTALL_OPTIONS} --allowerasing --spec ceph.spec

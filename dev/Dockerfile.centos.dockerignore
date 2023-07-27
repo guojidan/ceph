@@ -1,0 +1,8 @@
+**
+# Exclude everything except:
+!ceph.spec.in
+!install-deps.sh
+!run-make-check.sh
+!do_cmake.sh
+!src/script/lib-build.sh
+!src/script/run-make.sh

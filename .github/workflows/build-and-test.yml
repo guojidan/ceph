@@ -1,0 +1,80 @@
+name: Build and Test
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro-name: centos
+            distro-release: stream8
+          #- distro-name: centos
+          #  distro-release: stream9
+          #- ubuntu:20.04
+          #- ubuntu:22.04
+    name: ${{ matrix.distro-name }}:${{ matrix.distro-release }}
+    # timeout-minutes: 120
+    steps:
+      - uses: docker/setup-buildx-action@v2
+      - uses: actions/checkout@v3
+      - uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: dev/Dockerfile.${{ matrix.distro-name }}
+          build-args: |
+            CENTOS_TAG=${{ matrix.distro-release }}
+          push: false
+          cache-from: type=gha,scope=${{ matrix.distro-name }}-${{ matrix.distro-release }}
+          cache-to: type=gha,mode=min,scope=${{ matrix.distro-name }}-${{ matrix.distro-release }}
+
+    # container:
+    #   image: ${{ matrix.distro-image }}
+    #   options: --user root
+    # defaults:
+    #   run:
+    #     shell: bash
+    # env:
+    #   DNF_INSTALL_OPTIONS: >-
+    #     --setopt=fastestmirror=true
+    #     --setopt=keepcache=true
+    #     --nodocs
+    # steps:
+    #   - name: Check out git repository ${{ github.repository }}
+    #     uses: actions/checkout@v3
+    #   - name: "Restore cache: dnf"
+    #     uses: actions/cache@v3
+    #     if: matrix.distro-name == 'centos'
+    #     with:
+    #       path: |
+    #         /var/cache/dnf
+    #         /var/lib/dnf
+    #       key: build-${{ matrix.distro-name }}-${{ matrix.distro-release }}-dnf
+    #   - name: "Restore cache: pip"
+    #     uses: actions/cache@v3
+    #     with:
+    #       path: |
+    #         /github/home/.cache/pip
+    #       key: build-${{ matrix.distro-name }}-${{ matrix.distro-release }}-pip
+    #   - name: Install dependencies
+    #     run: |
+    #       . ./run-make-check.sh
+    #       FOR_MAKE_CHECK=1 prepare
+    #   #- name: Configure
+    #   #  run: |
+    #   #    . ./run-make-check.sh
+    #   #    configure
+    #   # - name: Build
+    #   #   run: |
+    #   #     . ./run-make-check.sh
+    #   #     build vstart
+    #   # - name: Test
+    #   #   run: |
+    #   #     . ./run-make-check.sh
+    #   #     build tests
+    #   #     cd build
+    #   #     run

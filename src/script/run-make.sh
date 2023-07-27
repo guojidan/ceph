@@ -56,7 +56,7 @@ function prepare() {
 
     if test -f ./install-deps.sh ; then
         ci_debug "Running install-deps.sh"
-        INSTALL_EXTRA_PACKAGES="ccache git $which_pkg clang"
+        INSTALL_EXTRA_PACKAGES="ccache git $which_pkg clang curl"
         $DRY_RUN source ./install-deps.sh || return 1
         trap clean_up_after_myself EXIT
     fi
@@ -78,7 +78,7 @@ EOM
     $DRY_RUN export SOURCE_DATE_EPOCH="946684800"
     $DRY_RUN ccache -o sloppiness=time_macros
     $DRY_RUN ccache -o run_second_cpp=true
-    if in_jenkins; then
+    if in_ci; then
         # Build host has plenty of space available, let's use it to keep
         # various versions of the built objects. This could increase the cache hit
         # if the same or similar PRs are running several times
