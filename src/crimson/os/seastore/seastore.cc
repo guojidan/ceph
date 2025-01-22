@@ -1280,7 +1280,7 @@ SeaStore::Shard::_get_attrs(
   LOG_PREFIX(SeaStoreS::_get_attrs);
   DEBUGT("...", t);
   auto& layout = onode.get_layout();
-  return omap_list(onode, layout.xattr_root, t, std::nullopt,
+  return omap_list(onode, layout.xattr_root, t, std::nullopt, std::nullopt,
     OMapManager::omap_list_config_t()
       .with_inclusive(false, false)
       .without_max()
@@ -1499,6 +1499,7 @@ SeaStore::Shard::omap_list(
   const omap_root_le_t& omap_root,
   Transaction& t,
   const std::optional<std::string>& start,
+  const std::optional<std::string>& filter_prefix,
   OMapManager::omap_list_config_t config) const
 {
   auto root = omap_root.get(
@@ -1513,8 +1514,9 @@ SeaStore::Shard::omap_list(
     root,
     start,
     std::optional<std::string>(std::nullopt),
-    [&t, config](auto &manager, auto &root, auto &start, auto &end) {
-      return manager.omap_list(root, t, start, end, config);
+    filter_prefix,
+    [&t, config](auto &manager, auto &root, auto &start, auto &end, auto &filter_prefix) {
+      return manager.omap_list(root, t, start, end, filter_prefix, config);
   });
 }
 
@@ -1522,7 +1524,8 @@ SeaStore::base_iertr::future<SeaStore::Shard::omap_values_paged_t>
 SeaStore::Shard::do_omap_get_values(
   Transaction& t,
   Onode& onode,
-  const std::optional<std::string>& start)
+  const std::optional<std::string>& start,
+  const std::optional<std::string>& filter_prefix)
 {
   LOG_PREFIX(SeaStoreS::do_omap_get_values);
   DEBUGT("start={} ...", t, start.has_value() ? *start : "");
@@ -1531,6 +1534,7 @@ SeaStore::Shard::do_omap_get_values(
     onode.get_layout().omap_root,
     t,
     start,
+    filter_prefix,
     OMapManager::omap_list_config_t()
       .with_inclusive(false, false)
       .without_max()
@@ -1546,6 +1550,7 @@ SeaStore::Shard::omap_get_values(
   CollectionRef ch,
   const ghobject_t &oid,
   const std::optional<std::string> &start,
+  const std::optional<std::string> &filter_prefix, ///< [in] filter_prefix, empty for all omap
   uint32_t op_flags)
 {
   ++(shard_stats.read_num);
@@ -1558,8 +1563,8 @@ SeaStore::Shard::omap_get_values(
     "omap_get_values2",
     op_type_t::OMAP_GET_VALUES2,
     op_flags,
-    [this, start](auto &t, auto &onode) {
-    return do_omap_get_values(t, onode, start);
+    [this, start, filter_prefix](auto &t, auto &onode) {
+    return do_omap_get_values(t, onode, start, filter_prefix);
   }).finally([this] {
     assert(shard_stats.pending_read_num);
     --(shard_stats.pending_read_num);
@@ -2148,6 +2153,7 @@ SeaStore::Shard::_clone_omaps(
 	  : layout.omap_root,
 	*ctx.transaction,
 	start,
+  std::nullopt,
 	OMapManager::omap_list_config_t().with_inclusive(false, false)
       ).si_then([&ctx, onode, d_onode, this, otype, &start](auto p) mutable {
 	auto complete = std::get<0>(p);

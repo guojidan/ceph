@@ -1313,10 +1313,11 @@ maybe_get_omap_vals(
   crimson::os::FuturizedStore::Shard* store,
   const crimson::os::CollectionRef& coll,
   const object_info_t& oi,
-  const std::string& start_after)
+  const std::string& start_after,
+  const std::optional<std::string> &filter_prefix)
 {
   if (oi.is_omap()) {
-    return store->omap_get_values(coll, ghobject_t{oi.soid}, start_after);
+    return store->omap_get_values(coll, ghobject_t{oi.soid}, start_after, filter_prefix);
   } else {
     return crimson::ct_error::enodata::make();
   }
@@ -1385,7 +1386,7 @@ PGBackend::omap_get_keys(
 
 
   // TODO: truly chunk the reading
-  return maybe_get_omap_vals(store, coll, os.oi, start_after).safe_then_interruptible(
+  return maybe_get_omap_vals(store, coll, os.oi, start_after, std::nullopt).safe_then_interruptible(
     [=,&delta_stats, &osd_op](auto ret) {
       ceph::bufferlist result;
       bool truncated = false;
@@ -1511,7 +1512,7 @@ PGBackend::omap_get_vals(
   delta_stats.num_rd++;
 
   // TODO: truly chunk the reading
-  return maybe_get_omap_vals(store, coll, os.oi, start_after)
+  return maybe_get_omap_vals(store, coll, os.oi, start_after, filter_prefix)
   .safe_then_interruptible(
     [=, &osd_op] (auto&& ret) {
       auto [done, vals] = std::move(ret);

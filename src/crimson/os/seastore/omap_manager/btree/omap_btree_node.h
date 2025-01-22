@@ -80,6 +80,7 @@ struct OMapNode : LogicalCachedExtent {
     omap_context_t oc,
     const std::optional<std::string> &first,
     const std::optional<std::string> &last,
+    const std::optional<std::string> &filter_prefix,
     omap_list_config_t config) = 0;
 
   using clear_iertr = base_iertr;

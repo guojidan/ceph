@@ -92,6 +92,7 @@ public:
       CollectionRef c,           ///< [in] collection
       const ghobject_t &oid,     ///< [in] oid
       const std::optional<std::string> &start, ///< [in] start, empty for begin
+      const std::optional<std::string> &filter_prefix, ///< [in] filter_prefix, empty for all omap
       uint32_t op_flags = 0
       ) = 0; ///< @return <done, values> values.empty() only if done
 

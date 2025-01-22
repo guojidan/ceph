@@ -170,6 +170,7 @@ public:
     Transaction &t,
     const std::optional<std::string> &first,
     const std::optional<std::string> &last,
+    const std::optional<std::string> &filter_prefix,
     omap_list_config_t config = omap_list_config_t()) = 0;
 
   /**

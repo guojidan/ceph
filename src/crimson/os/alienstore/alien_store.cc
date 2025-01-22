@@ -427,6 +427,7 @@ auto AlienStore::omap_get_values(CollectionRef ch,
 auto AlienStore::omap_get_values(CollectionRef ch,
                                  const ghobject_t &oid,
                                  const std::optional<string> &start,
+                                 const std::optional<std::string> &filter_prefix, ///< [in] filter_prefix, empty for all omap
 				 uint32_t op_flags)
   -> read_errorator::future<std::tuple<bool, omap_values_t>>
 {

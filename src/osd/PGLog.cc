@@ -1155,7 +1155,7 @@ namespace {
                std::optional<std::string> &start) {
           return seastar::repeat([this, &ch, &pgmeta_oid, &start]() {
             return store.omap_get_values(
-              ch, pgmeta_oid, start
+              ch, pgmeta_oid, start, std::nullopt
             ).safe_then([this, &start](const auto& ret) {
               const auto& [done, kvs] = ret;
               for (const auto& [key, value] : kvs) {

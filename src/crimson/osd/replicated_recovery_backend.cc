@@ -703,7 +703,7 @@ ReplicatedRecoveryBackend::read_omap_for_push_op(
   }
   return seastar::repeat([&new_progress, &max_len, push_op, &oid, this] {
     return shard_services.get_store().omap_get_values(
-      coll, ghobject_t{oid}, nullopt_if_empty(new_progress.omap_recovered_to)
+      coll, ghobject_t{oid}, nullopt_if_empty(new_progress.omap_recovered_to), std::nullopt
     ).safe_then([&new_progress, &max_len, push_op](const auto& ret) {
       const auto& [done, kvs] = ret;
       bool stop = done;

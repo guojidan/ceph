@@ -213,6 +213,7 @@ BtreeOMapManager::omap_rm_key_range(
       t,
       first,
       last,
+      std::nullopt,
       config);
   }).si_then([this, &omap_root, &t](auto results) {
     LOG_PREFIX(BtreeOMapManager::omap_rm_key_range);
@@ -241,6 +242,7 @@ BtreeOMapManager::omap_list(
   Transaction &t,
   const std::optional<std::string> &first,
   const std::optional<std::string> &last,
+  const std::optional<std::string> &filter_prefix,
   omap_list_config_t config)
 {
   LOG_PREFIX(BtreeOMapManager::omap_list);
@@ -258,11 +260,12 @@ BtreeOMapManager::omap_list(
   return get_omap_root(
     get_omap_context(t, omap_root.hint),
     omap_root
-  ).si_then([this, config, &t, &first, &last, &omap_root](auto extent) {
+  ).si_then([this, config, &t, &first, &last, &filter_prefix, &omap_root](auto extent) {
     return extent->list(
       get_omap_context(t, omap_root.hint),
       first,
       last,
+      filter_prefix,
       config);
   });
 }

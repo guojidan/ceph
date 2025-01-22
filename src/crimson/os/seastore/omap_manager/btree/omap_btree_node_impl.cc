@@ -197,18 +197,20 @@ OMapInnerNode::list(
   omap_context_t oc,
   const std::optional<std::string> &first,
   const std::optional<std::string> &last,
+  const std::optional<std::string> &filter_prefix,
   omap_list_config_t config)
 {
   LOG_PREFIX(OMapInnerNode::list);
+  auto prefix_str = filter_prefix ? *filter_prefix : "";
   if (first && last) {
-    DEBUGT("first: {}, last: {}, this: {}", oc.t, *first, *last, *this);
+    DEBUGT("first: {}, last: {}, filter_prefix: {} this: {}", oc.t, *first, *last, prefix_str, *this);
     assert(*first <= *last);
   } else if (first) {
-    DEBUGT("first: {}, this: {}", oc.t, *first, *this);
+    DEBUGT("first: {}, filter_prefix: {}, this: {}", oc.t, *first, prefix_str, *this);
   } else if (last) {
-    DEBUGT("last: {}, this: {}", oc.t, *last, *this);
+    DEBUGT("last: {}, filter_prefix: {} this: {}", oc.t, *last, prefix_str, *this);
   } else {
-    DEBUGT("this: {}", oc.t, *this);
+    DEBUGT("filter_prefix: {} this: {}", oc.t, prefix_str, *this);
   }
 
   auto first_iter = first ?
@@ -224,7 +226,7 @@ OMapInnerNode::list(
     last_iter,
     iter_t(first_iter),
     list_bare_ret(false, {}),
-    [this, &first, &last, oc, config](
+    [this, &first, &last, &filter_prefix, oc, config, FNAME](
       auto &fiter,
       auto &liter,
       auto &iter,
@@ -240,7 +242,12 @@ OMapInnerNode::list(
           return list_iertr::make_ready_future<seastar::stop_iteration>(
             seastar::stop_iteration::yes);
         }
-	assert(result.size() < config.max_result_size);
+        if (!iter.contains(*filter_prefix)) {
+            ++iter;
+            return list_iertr::make_ready_future<seastar::stop_iteration>(
+              seastar::stop_iteration::no);
+        }
+        assert(result.size() < config.max_result_size);
         auto laddr = iter->get_val();
         return omap_load_extent(
           oc, laddr,
@@ -249,13 +256,14 @@ OMapInnerNode::list(
 	  return seastar::do_with(
 	    iter == fiter ? first : std::optional<std::string>(std::nullopt),
 	    iter == liter - 1 ? last : std::optional<std::string>(std::nullopt),
-	    [&result, extent = std::move(extent), config, oc](
+	    [&result, extent = std::move(extent), filter_prefix, config, oc](
 	      auto &nfirst,
 	      auto &nlast) {
 	    return extent->list(
 	      oc,
 	      nfirst,
 	      nlast,
+        filter_prefix,
 	      config.with_reduced_max(result.size()));
 	  }).si_then([&, config](auto &&child_ret) mutable {
 	    boost::ignore_unused(config);   // avoid clang warning;
@@ -624,15 +632,17 @@ OMapLeafNode::list(
   omap_context_t oc,
   const std::optional<std::string> &first,
   const std::optional<std::string> &last,
+  const std::optional<std::string> &filter_prefix,
   omap_list_config_t config)
 {
   LOG_PREFIX(OMapLeafNode::list);
   DEBUGT(
-    "first {} last {}  max_result_size {} first_inclusive {} \
+    "first {} last {} filter_prefix {} max_result_size {} first_inclusive {} \
     last_inclusive {}, this: {}",
     oc.t,
     first ? first->c_str() : "",
     last ? last->c_str() : "",
+    filter_prefix ? filter_prefix->c_str() : "",
     config.max_result_size,
     config.first_inclusive,
     config.last_inclusive,
@@ -652,6 +662,10 @@ OMapLeafNode::list(
     iter_end();
 
   for (; iter != liter && result.size() < config.max_result_size; iter++) {
+    if (iter.get_key().starts_with(*filter_prefix)) {
+      DEBUG("not filter_prefix break");
+      break;
+    }
     result.emplace(std::make_pair(iter->get_key(), iter->get_val()));
     DEBUGT("found key {}", oc.t, iter->get_key());
   }

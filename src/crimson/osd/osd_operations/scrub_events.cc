@@ -294,7 +294,8 @@ ScrubScan::ifut<> ScrubScan::deep_scan_object(
 	return pg.shard_services.get_store().omap_get_values(
 	  pg.get_collection_ref(),
 	  obj,
-	  progress.next_key
+	  progress.next_key,
+    std::nullopt
 	).safe_then([FNAME, this, &obj, &progress, &entry, &pg](auto result) {
 	  const auto &[done, omap] = result;
 	  DEBUGDPP("op: {}, obj: {}, progress: {} got {} keys",

@@ -144,6 +144,7 @@ public:
       CollectionRef c,           ///< [in] collection
       const ghobject_t &oid,     ///< [in] oid
       const std::optional<std::string> &start, ///< [in] start, empty for begin
+      const std::optional<std::string> &filter_prefix, ///< [in] filter_prefix, empty for all omap
       uint32_t op_flags = 0
       ) final; ///< @return <done, values> values.empty() iff done
 
@@ -353,6 +354,7 @@ public:
       const omap_root_le_t& omap_root,
       Transaction& t,
       const std::optional<std::string>& start,
+      const std::optional<std::string>& filter_prefix,
       OMapManager::omap_list_config_t config) const;
 
     using _omap_get_value_iertr = base_iertr::extend<
@@ -400,7 +402,8 @@ public:
     base_iertr::future<omap_values_paged_t> do_omap_get_values(
       Transaction& t,
       Onode& onode,
-      const std::optional<std::string>& start);
+      const std::optional<std::string>& start,
+      const std::optional<std::string>& filter_prefix);
 
     base_iertr::future<fiemap_ret_t> _fiemap(
       Transaction &t,
