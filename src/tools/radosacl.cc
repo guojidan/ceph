@@ -121,8 +121,7 @@ void get_user(ACLID& aclid, ACLEntity *entity)
 
 
 
-int main(int argc, const char **argv) 
-{
+int main(int argc, const char **argv) {
   Rados rados;
   if (rados.init(NULL) < 0) {
      cerr << "couldn't initialize rados!" << std::endl;

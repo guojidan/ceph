@@ -144,6 +144,15 @@ class BlueStore : public ObjectStore,
   // -----------------------------------------------------
   // types
 public:
+  // 允许ceph-objectstore-tool灾难恢复功能访问BlueFS
+  friend int scan_rocksdb_corruption(ObjectStore *store, vector<string>& corrupted_files);
+  friend int analyze_disk_usage(ObjectStore *store);
+  friend int list_wal_files(ObjectStore *store);
+  friend int clean_old_wal(ObjectStore *store, bool force, bool dry_run);
+  friend int compact_rocksdb_offline(ObjectStore *store, bool force);
+  friend int recover_full_disk(ObjectStore *store, bool aggressive, bool dry_run);
+  friend int auto_repair_rocksdb(ObjectStore *store, const string& temp_dir, bool keep_corrupted, bool dry_run);
+
   // config observer
   const char** get_tracked_conf_keys() const override;
   void handle_conf_change(const ConfigProxy& conf,

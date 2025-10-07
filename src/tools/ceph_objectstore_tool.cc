@@ -18,6 +18,8 @@
 #include <boost/optional.hpp>
 
 #include <stdlib.h>
+#include <time.h>
+#include <array>
 
 #include "common/Formatter.h"
 #include "common/errno.h"
@@ -44,8 +46,119 @@
 #include "ceph_objectstore_tool.h"
 #include "include/compat.h"
 #include "include/util.h"
+#include "mon/MonClient.h"
+#include "messages/PaxosServiceMessage.h"
+#include "messages/MMonGetOSDMap.h"
+#include "messages/MOSDMap.h"
+#include "msg/Messenger.h"
+#include "os/bluestore/BlueStore.h"
+
+// RocksDB headers for SST repair
+#include "rocksdb/db.h"
+#include "rocksdb/sst_file_reader.h"
+#include "rocksdb/sst_file_writer.h"
+#include "rocksdb/table.h"
+#include "rocksdb/options.h"
+#include "kv/RocksDBStore.h"
+
+#include <sys/wait.h>
 
 namespace po = boost::program_options;
+
+// 常量定义
+static const epoch_t SUPERBLOCK_EPOCH_SAFE_MARGIN = 10;  // superblock epoch安全边界
+static const int MAX_TEMP_FILE_RETRIES = 3;  // 临时文件创建重试次数
+static const double DISK_FULL_THRESHOLD = 95.0;  // 磁盘满阈值（百分比）
+
+// RAII类管理文件描述符
+class FdGuard {
+  int fd;
+public:
+  explicit FdGuard(int f) : fd(f) {}
+  ~FdGuard() {
+    if (fd >= 0) {
+      ::close(fd);
+    }
+  }
+  int get() const { return fd; }
+  int release() {
+    int ret = fd;
+    fd = -1;
+    return ret;
+  }
+  // 禁止拷贝
+  FdGuard(const FdGuard&) = delete;
+  FdGuard& operator=(const FdGuard&) = delete;
+};
+
+// RAII类管理临时文件
+class TempFileGuard {
+  string path;
+  bool keep;
+public:
+  explicit TempFileGuard(const string& p, bool k = false) : path(p), keep(k) {}
+  ~TempFileGuard() {
+    if (!keep && !path.empty()) {
+      ::unlink(path.c_str());
+    }
+  }
+  const string& get_path() const { return path; }
+  void set_keep(bool k) { keep = k; }
+  // 禁止拷贝
+  TempFileGuard(const TempFileGuard&) = delete;
+  TempFileGuard& operator=(const TempFileGuard&) = delete;
+};
+
+// 安全执行命令，避免命令注入
+static int safe_exec(const vector<string>& args)
+{
+  if (args.empty()) {
+    return -EINVAL;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    return -errno;
+  }
+
+  if (pid == 0) {
+    // 子进程：执行命令
+    vector<char*> argv;
+    for (const auto& arg : args) {
+      argv.push_back(const_cast<char*>(arg.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    execvp(argv[0], argv.data());
+    // 如果execvp返回，说明失败
+    _exit(127);
+  }
+
+  // 父进程：等待子进程
+  int status;
+  if (waitpid(pid, &status, 0) < 0) {
+    return -errno;
+  }
+
+  if (WIFEXITED(status)) {
+    return WEXITSTATUS(status);
+  }
+
+  return -ECHILD;
+}
+
+// Nautilus适配：辅助函数统一处理BlueFS get_usage API
+static void bluefs_get_usage_nautilus(BlueFS* bluefs, uint64_t* total, uint64_t* used) {
+  vector<pair<uint64_t,uint64_t>> usage_vec;
+  bluefs->get_usage(&usage_vec);
+
+  *total = 0;
+  *used = 0;
+  for (auto& p : usage_vec) {
+    *total += p.second;  // total
+    *used += (p.second - p.first);  // total - free = used
+  }
+}
 
 #ifdef INTERNAL_TEST
 CompatSet get_test_compat_set() {
@@ -74,6 +187,11 @@ const ssize_t max_read = 1024 * 1024;
 const int fd_none = INT_MIN;
 bool outistty;
 bool dry_run;
+
+static int collect_bluefs_wal_files(
+    BlueFS* bluefs,
+    vector<pair<uint64_t, string>>* wal_files,
+    string* wal_dir);
 
 struct action_on_object_t {
   virtual ~action_on_object_t() {}
@@ -847,6 +965,1479 @@ int get_osdmap(ObjectStore *store, epoch_t e, OSDMap &osdmap, bufferlist& bl)
   if (debug)
     cerr << osdmap << std::endl;
   return 0;
+}
+
+// 从Monitor集群获取OSDMap并写入到ObjectStore
+// 使用ceph命令行工具获取OSDMap，避免复杂的消息处理
+int fetch_osdmaps_from_mon(ObjectStore *store, epoch_t first, epoch_t last,
+                            bool get_full, bool force)
+{
+  if (first > last) {
+    cerr << "Invalid epoch range: " << first << " > " << last << std::endl;
+    return -EINVAL;
+  }
+
+  if (first == 0) {
+    cerr << "First epoch must be greater than 0" << std::endl;
+    return -EINVAL;
+  }
+
+  cout << "Fetching OSDMaps from epoch " << first << " to " << last
+       << (get_full ? " (full maps)" : " (incremental maps)") << std::endl;
+
+  int success_count = 0;
+  int fail_count = 0;
+
+  for (epoch_t e = first; e <= last; e++) {
+    // 创建临时文件（使用RAII自动清理）
+    char tmpfile[] = "/tmp/osdmap.XXXXXX";
+    int fd = mkstemp(tmpfile);
+    if (fd < 0) {
+      cerr << "Failed to create temporary file: " << cpp_strerror(errno) << std::endl;
+      fail_count++;
+      continue;
+    }
+
+    FdGuard fd_guard(fd);  // RAII管理fd
+    TempFileGuard file_guard(tmpfile);  // RAII管理临时文件
+
+    // 使用ceph命令获取OSDMap（安全方式，避免命令注入）
+    vector<string> cmd_args = {"ceph", "osd", "getmap", to_string(e)};
+    if (!get_full) {
+      cmd_args.push_back("--incremental");
+    }
+    cmd_args.push_back("-o");
+    cmd_args.push_back(tmpfile);
+
+    if (debug) {
+      cout << "Executing: ceph osd getmap " << e
+           << (get_full ? "" : " --incremental")
+           << " -o " << tmpfile << std::endl;
+    }
+
+    int ret = safe_exec(cmd_args);
+    if (ret != 0) {
+      cerr << "Failed to fetch OSDMap epoch " << e << " from monitors (exit code: "
+           << ret << ")" << std::endl;
+      fail_count++;
+      continue;
+    }
+
+    // 读取临时文件
+    bufferlist bl;
+    string error;
+    ret = bl.read_file(tmpfile, &error);
+
+    if (ret < 0) {
+      cerr << "Failed to read temporary file for epoch " << e << ": " << error << std::endl;
+      fail_count++;
+      continue;
+    }
+
+    // 写入到ObjectStore
+    if (get_full) {
+      cout << "Writing full OSDMap epoch " << e << " (" << bl.length() << " bytes)" << std::endl;
+      ret = set_osdmap(store, e, bl, force);
+    } else {
+      cout << "Writing incremental OSDMap epoch " << e << " (" << bl.length() << " bytes)" << std::endl;
+      ret = set_inc_osdmap(store, e, bl, force);
+    }
+
+    if (ret < 0) {
+      cerr << "Failed to write OSDMap epoch " << e << " to objectstore: "
+           << cpp_strerror(ret) << std::endl;
+      fail_count++;
+    } else {
+      success_count++;
+    }
+  }
+
+  cout << "Fetch complete: " << success_count << " succeeded, "
+       << fail_count << " failed" << std::endl;
+
+  return (success_count > 0) ? 0 : -EIO;
+}
+
+// 从Monitor集群获取当前epoch
+int get_current_epoch_from_mon()
+{
+  // 使用ceph命令获取当前epoch
+  char tmpfile[] = "/tmp/osdmap_current.XXXXXX";
+  int fd = mkstemp(tmpfile);
+  if (fd < 0) {
+    cerr << "Failed to create temporary file: " << cpp_strerror(errno) << std::endl;
+    return -1;
+  }
+
+  FdGuard fd_guard(fd);  // RAII管理fd
+  TempFileGuard file_guard(tmpfile);  // RAII管理临时文件
+
+  // 获取当前的OSDMap（安全方式）
+  vector<string> cmd_args = {"ceph", "osd", "getmap", "-o", tmpfile};
+
+  if (debug) {
+    cout << "Executing: ceph osd getmap -o " << tmpfile << std::endl;
+  }
+
+  int ret = safe_exec(cmd_args);
+  if (ret != 0) {
+    cerr << "Failed to fetch current OSDMap from monitors (exit code: "
+         << ret << ")" << std::endl;
+    return -1;
+  }
+
+  // 读取OSDMap并解析epoch
+  bufferlist bl;
+  string error;
+  ret = bl.read_file(tmpfile, &error);
+
+  if (ret < 0) {
+    cerr << "Failed to read temporary OSDMap file: " << error << std::endl;
+    return -1;
+  }
+
+  // 解码OSDMap获取epoch
+  OSDMap osdmap;
+  try {
+    osdmap.decode(bl);
+    epoch_t current_epoch = osdmap.get_epoch();
+    cout << "Current cluster epoch: " << current_epoch << std::endl;
+    return current_epoch;
+  } catch (const buffer::error &e) {
+    cerr << "Failed to decode OSDMap: " << e.what() << std::endl;
+    return -1;
+  }
+}
+
+// 尝试从BlueStore fsid文件读取OSD FSID
+static int read_osd_fsid_from_file(const string& data_path, uuid_d* fsid)
+{
+  string fsid_path = data_path + "/fsid";
+
+  int fd = ::open(fsid_path.c_str(), O_RDONLY|O_CLOEXEC);
+  if (fd < 0) {
+    int err = -errno;
+    if (err != -ENOENT) {
+      cerr << "Failed to open fsid file: " << cpp_strerror(err) << std::endl;
+    }
+    return err;
+  }
+
+  char fsid_str[40];
+  memset(fsid_str, 0, sizeof(fsid_str));
+  int ret = ::read(fd, fsid_str, sizeof(fsid_str));
+  ::close(fd);
+
+  if (ret < 0) {
+    cerr << "Failed to read fsid file: " << cpp_strerror(-errno) << std::endl;
+    return -errno;
+  }
+
+  // 去除换行符
+  if (ret > 36)
+    fsid_str[36] = 0;
+  else
+    fsid_str[ret] = 0;
+
+  // 移除末尾的空白字符
+  for (int i = ret - 1; i >= 0; i--) {
+    if (fsid_str[i] == '\n' || fsid_str[i] == '\r' || fsid_str[i] == ' ') {
+      fsid_str[i] = 0;
+    } else {
+      break;
+    }
+  }
+
+  if (!fsid->parse(fsid_str)) {
+    cerr << "Failed to parse fsid from file: '" << fsid_str << "'" << std::endl;
+    return -EINVAL;
+  }
+
+  return 0;
+}
+
+// 重建OSD superblock
+int rebuild_superblock(ObjectStore *store, const string& data_path,
+                       int32_t osd_id,
+                       const string& cluster_fsid_str,
+                       const string& osd_fsid_str,
+                       epoch_t current_epoch,
+                       bool force,
+                       bool mounted)
+{
+  cout << "Rebuilding OSD superblock..." << std::endl;
+
+  // 创建新的superblock
+  OSDSuperblock new_sb;
+
+  // 设置OSD ID
+  new_sb.whoami = osd_id;
+
+  // 设置cluster FSID
+  if (!cluster_fsid_str.empty()) {
+    if (!new_sb.cluster_fsid.parse(cluster_fsid_str.c_str())) {
+      cerr << "Invalid cluster fsid: " << cluster_fsid_str << std::endl;
+      return -EINVAL;
+    }
+  } else {
+    // cluster fsid必须明确指定
+    cerr << "Must provide --cluster-fsid" << std::endl;
+    return -EINVAL;
+  }
+
+  // 设置OSD FSID - 优先从本地fsid文件读取
+  if (!osd_fsid_str.empty()) {
+    // 用户明确指定了OSD FSID
+    if (!new_sb.osd_fsid.parse(osd_fsid_str.c_str())) {
+      cerr << "Invalid OSD fsid: " << osd_fsid_str << std::endl;
+      return -EINVAL;
+    }
+    cout << "Using user-provided OSD fsid: " << new_sb.osd_fsid << std::endl;
+  } else {
+    // 尝试从BlueStore的fsid文件读取
+    BlueStore* bstore = dynamic_cast<BlueStore*>(store);
+    if (bstore && !bstore->get_fsid().is_zero()) {
+      // 如果BlueStore已经加载了fsid，直接使用
+      new_sb.osd_fsid = bstore->get_fsid();
+      cout << "Read OSD fsid from BlueStore: " << new_sb.osd_fsid << std::endl;
+    } else {
+      // 尝试直接从文件读取（适用于BlueStore未完全初始化的情况）
+      int ret = read_osd_fsid_from_file(data_path, &new_sb.osd_fsid);
+      if (ret == 0) {
+        cout << "Read OSD fsid from fsid file: " << new_sb.osd_fsid << std::endl;
+      } else if (ret == -ENOENT) {
+        // fsid文件不存在，这是严重错误
+        cerr << "ERROR: fsid file not found at " << data_path << "/fsid" << std::endl;
+        cerr << "Cannot rebuild superblock without OSD FSID!" << std::endl;
+        cerr << "Please provide --osd-fsid if you know the original OSD FSID" << std::endl;
+        return -ENOENT;
+      } else {
+        // 读取失败
+        cerr << "ERROR: Failed to read OSD fsid from " << data_path << "/fsid" << std::endl;
+        cerr << "Please provide --osd-fsid manually" << std::endl;
+        return ret;
+      }
+    }
+
+    // 验证读取的FSID不是全零
+    if (new_sb.osd_fsid.is_zero()) {
+      cerr << "ERROR: OSD FSID is all zeros, this is invalid!" << std::endl;
+      cerr << "Please provide correct --osd-fsid" << std::endl;
+      return -EINVAL;
+    }
+  }
+
+  // 设置epoch信息
+  if (current_epoch <= 0) {
+    epoch_t local_newest = 0;
+
+    // 只有在ObjectStore成功mount的情况下才尝试读取本地OSDMap
+    if (mounted) {
+      // 尝试从本地ObjectStore读取最新的OSDMap epoch
+      cout << "Attempting to detect epoch from local OSDMaps..." << std::endl;
+
+      auto ch = store->open_collection(coll_t::meta());
+
+      // 尝试读取最近的几个epoch，找到最大的有效epoch
+      for (epoch_t e = 10000; e > 0; e--) {
+        bufferlist bl;
+        int ret = store->read(ch, OSD::get_osdmap_pobject_name(e), 0, 1, bl);
+        if (ret >= 0) {
+          local_newest = e;
+          break;
+        }
+        // 每100个epoch跳跃一次加速查找
+        if (e > 100) {
+          e -= 99;
+        }
+      }
+
+      if (local_newest > 0) {
+        current_epoch = local_newest + 10;  // 给一些余量
+        cout << "  Found local OSDMap epoch " << local_newest << ", using " << current_epoch << " for rebuild" << std::endl;
+      }
+    }
+
+    // 如果mount失败或本地没有找到OSDMap，尝试从Monitor获取
+    if (local_newest == 0) {
+      if (!mounted) {
+        cout << "ObjectStore mount failed, cannot read local OSDMaps" << std::endl;
+      } else {
+        cout << "No local OSDMaps found" << std::endl;
+      }
+      cout << "Trying to fetch epoch from monitors..." << std::endl;
+
+      int mon_epoch = get_current_epoch_from_mon();
+      if (mon_epoch < 0) {
+        cerr << "\nERROR: Cannot determine cluster epoch!" << std::endl;
+        cerr << "Please specify --current-epoch manually" << std::endl;
+        cerr << "\nTo find the current epoch:" << std::endl;
+        cerr << "  1. Run 'ceph osd dump | grep epoch' on a working monitor" << std::endl;
+        cerr << "  2. Or use a conservative value like 1000" << std::endl;
+        return -EINVAL;
+      }
+      current_epoch = mon_epoch;
+      cout << "  Retrieved epoch " << current_epoch << " from monitors" << std::endl;
+    }
+  }
+
+  // 设置epoch比集群当前epoch小一些，留出安全边界
+  new_sb.current_epoch = (current_epoch > SUPERBLOCK_EPOCH_SAFE_MARGIN) ?
+                         (current_epoch - SUPERBLOCK_EPOCH_SAFE_MARGIN) : 1;
+  new_sb.oldest_map = 1;
+  new_sb.newest_map = new_sb.current_epoch;
+
+  // 设置其他字段
+  new_sb.mounted = 0;
+  new_sb.clean_thru = 0;
+  new_sb.weight = 1.0;  // 默认权重
+
+  // 设置兼容性特性
+  new_sb.compat_features.incompat.insert(CEPH_OSD_FEATURE_INCOMPAT_BASE);
+  new_sb.compat_features.incompat.insert(CEPH_OSD_FEATURE_INCOMPAT_PGINFO);
+  new_sb.compat_features.incompat.insert(CEPH_OSD_FEATURE_INCOMPAT_OLOC);
+  new_sb.compat_features.incompat.insert(CEPH_OSD_FEATURE_INCOMPAT_LEC);
+  new_sb.compat_features.incompat.insert(CEPH_OSD_FEATURE_INCOMPAT_CATEGORIES);
+  new_sb.compat_features.incompat.insert(CEPH_OSD_FEATURE_INCOMPAT_HOBJECTPOOL);
+  new_sb.compat_features.incompat.insert(CEPH_OSD_FEATURE_INCOMPAT_BIGINFO);
+  new_sb.compat_features.incompat.insert(CEPH_OSD_FEATURE_INCOMPAT_LEVELDBINFO);
+  new_sb.compat_features.incompat.insert(CEPH_OSD_FEATURE_INCOMPAT_LEVELDBLOG);
+  new_sb.compat_features.incompat.insert(CEPH_OSD_FEATURE_INCOMPAT_SNAPMAPPER);
+  new_sb.compat_features.incompat.insert(CEPH_OSD_FEATURE_INCOMPAT_SHARDS);
+
+  // 显示新的superblock信息
+  cout << "\nNew superblock:" << std::endl;
+  cout << "  Cluster FSID: " << new_sb.cluster_fsid << std::endl;
+  cout << "  OSD FSID: " << new_sb.osd_fsid << std::endl;
+  cout << "  OSD ID: " << new_sb.whoami << std::endl;
+  cout << "  Current epoch: " << new_sb.current_epoch << std::endl;
+  cout << "  Oldest map: " << new_sb.oldest_map << std::endl;
+  cout << "  Newest map: " << new_sb.newest_map << std::endl;
+  cout << "  Mounted: " << new_sb.mounted << std::endl;
+  cout << "  Clean thru: " << new_sb.clean_thru << std::endl;
+  cout << "  Weight: " << new_sb.weight << std::endl;
+  cout << "  Compat features: " << new_sb.compat_features << std::endl;
+  cout << std::endl;
+
+  // 写入superblock（或在dry-run模式下跳过）
+  if (!dry_run) {
+    bool need_umount = false;
+
+    // 如果store未mount，我们需要先重建block device label，然后mount
+    if (!mounted) {
+      // 尝试重建BlueStore的block device label
+      BlueStore* bstore = dynamic_cast<BlueStore*>(store);
+      if (bstore) {
+        cout << "Repairing BlueStore block device label..." << std::endl;
+
+        // 读取或重建label
+        bluestore_bdev_label_t label;
+        string block_path = data_path + "/block";
+
+        // 尝试读取现有label（可能已损坏）
+        int r = BlueStore::_read_bdev_label(g_ceph_context, block_path, &label);
+        if (r < 0) {
+          // Label损坏或不存在，需要重建
+          cout << "Block device label is corrupted or missing, rebuilding..." << std::endl;
+
+          // 设置必需的label字段
+          label.osd_uuid = new_sb.osd_fsid;
+          label.size = 0; // Will be detected from device
+          label.btime = ceph_clock_now();
+          label.description = "osd";
+
+          // 写入label
+          r = BlueStore::_write_bdev_label(g_ceph_context, block_path, label);
+          if (r < 0) {
+            cerr << "ERROR: Failed to write block device label: " << cpp_strerror(r) << std::endl;
+            return r;
+          }
+          cout << "✓ Block device label rebuilt" << std::endl;
+
+          // 同时确保fsid文件存在
+          string fsid_path = data_path + "/fsid";
+          struct stat st;
+          if (::stat(fsid_path.c_str(), &st) < 0) {
+            // fsid文件不存在，重建它
+            cout << "Rebuilding fsid file..." << std::endl;
+            int fd = ::open(fsid_path.c_str(), O_WRONLY|O_CREAT|O_TRUNC, 0644);
+            if (fd >= 0) {
+              string fsid_str = stringify(new_sb.osd_fsid) + "\n";
+              int ret = ::write(fd, fsid_str.c_str(), fsid_str.length());
+              ::close(fd);
+              if (ret >= 0) {
+                cout << "✓ fsid file rebuilt" << std::endl;
+              } else {
+                cerr << "WARNING: Failed to write fsid file: " << cpp_strerror(errno) << std::endl;
+              }
+            } else {
+              cerr << "WARNING: Failed to create fsid file: " << cpp_strerror(errno) << std::endl;
+            }
+          }
+        } else {
+          cout << "Block device label is readable, no repair needed" << std::endl;
+        }
+
+        // 无论label是否需要修复，都要确保fsid文件存在
+        string fsid_path = data_path + "/fsid";
+        struct stat st;
+        if (::stat(fsid_path.c_str(), &st) < 0) {
+          // fsid文件不存在，重建它
+          cout << "Rebuilding missing fsid file..." << std::endl;
+          int fd = ::open(fsid_path.c_str(), O_WRONLY|O_CREAT|O_TRUNC, 0644);
+          if (fd >= 0) {
+            string fsid_str = stringify(new_sb.osd_fsid) + "\n";
+            int ret = ::write(fd, fsid_str.c_str(), fsid_str.length());
+            ::close(fd);
+            if (ret >= 0) {
+              cout << "✓ fsid file rebuilt" << std::endl;
+            } else {
+              cerr << "WARNING: Failed to write fsid file: " << cpp_strerror(errno) << std::endl;
+            }
+          } else {
+            cerr << "WARNING: Failed to create fsid file: " << cpp_strerror(errno) << std::endl;
+          }
+        }
+      }
+
+      cout << "Attempting to mount ObjectStore for writing superblock..." << std::endl;
+      int ret = store->mount();
+      if (ret < 0) {
+        cerr << "ERROR: Failed to mount ObjectStore: " << cpp_strerror(ret) << std::endl;
+        cerr << "Cannot write superblock without mounting ObjectStore" << std::endl;
+        return ret;
+      }
+      need_umount = true;
+      cout << "✓ ObjectStore mounted successfully" << std::endl;
+    }
+
+    auto ch = store->open_collection(coll_t::meta());
+    bufferlist bl;
+    encode(new_sb, bl);
+
+    ObjectStore::Transaction t;
+    // 先写入数据，随后裁剪到精确长度，避免旧superblock缺失导致truncate报错
+    t.write(coll_t::meta(), OSD_SUPERBLOCK_GOBJECT, 0, bl.length(), bl);
+    t.truncate(coll_t::meta(), OSD_SUPERBLOCK_GOBJECT, bl.length());
+
+    int ret = store->queue_transaction(ch, std::move(t));
+    if (ret < 0) {
+      cerr << "Failed to write superblock: " << cpp_strerror(ret) << std::endl;
+      if (need_umount) {
+        store->umount();
+      }
+      return ret;
+    }
+
+    // 如果我们临时mount了store，现在umount它
+    if (need_umount) {
+      cout << "Unmounting ObjectStore..." << std::endl;
+      store->umount();
+      cout << "✓ ObjectStore unmounted" << std::endl;
+    }
+
+    cout << "✓ Superblock successfully rebuilt and written!" << std::endl;
+  } else {
+    cout << "ℹ️  Dry-run mode: superblock NOT written" << std::endl;
+  }
+
+  cout << std::endl;
+
+  cout << "\n=== IMPORTANT: Next Steps ===" << std::endl;
+  cout << "1. Fetch OSDMaps from monitors (if needed):" << std::endl;
+  cout << "   ceph-objectstore-tool --data-path <path> --op fetch-osdmaps \\" << std::endl;
+  cout << "     --epoch " << new_sb.oldest_map << " --epoch-end "
+       << new_sb.newest_map << " --force" << std::endl;
+  cout << std::endl;
+  cout << "2. Verify superblock:" << std::endl;
+  cout << "   ceph-objectstore-tool --data-path <path> --op dump-super" << std::endl;
+  cout << std::endl;
+  cout << "3. Start the OSD:" << std::endl;
+  cout << "   systemctl start ceph-osd@" << new_sb.whoami << std::endl;
+  cout << std::endl;
+
+  cout << "⚠️  Important Notes:" << std::endl;
+  cout << "  • clean_thru=0: Full peering will be triggered on first start" << std::endl;
+  cout << "  • past_intervals lost: PG recovery may take longer than usual" << std::endl;
+  cout << "  • If OSD fails to start, check:" << std::endl;
+  cout << "    - OSDMap epochs are complete (use fetch-osdmaps if needed)" << std::endl;
+  cout << "    - RocksDB integrity (use --op scan-rocksdb-corruption)" << std::endl;
+  cout << "    - Disk space (use --op analyze-disk-usage)" << std::endl;
+  cout << std::endl;
+  cout << "💡 Tip: Add --no-mon-config if monitors are unreachable" << std::endl;
+
+  return 0;
+}
+
+// 扫描RocksDB中损坏的SST文件
+// 使用RocksDB API扫描并验证SST文件
+int scan_rocksdb_corruption(ObjectStore *store, vector<string>& corrupted_files)
+{
+  cout << "Scanning RocksDB for corrupted SST files using RocksDB API..." << std::endl;
+
+  BlueStore* bstore = dynamic_cast<BlueStore*>(store);
+  if (!bstore) {
+    cerr << "This operation only works with BlueStore" << std::endl;
+    return -EINVAL;
+  }
+
+  BlueFS* bluefs = bstore->bluefs;
+  if (!bluefs) {
+    cerr << "BlueFS not available" << std::endl;
+    return -ENODEV;
+  }
+
+  // 列出db目录中的所有文件
+  vector<string> files;
+  int r = bluefs->readdir("db", &files);
+  if (r < 0) {
+    cerr << "Failed to read db directory: " << cpp_strerror(r) << std::endl;
+    return r;
+  }
+
+  // 为验证创建临时目录
+  string temp_dir = "/tmp/ceph_sst_verify_" + stringify(getpid());
+  ::mkdir(temp_dir.c_str(), 0755);
+
+  // 检查每个SST文件
+  size_t file_index = 0;
+  for (const auto& file : files) {
+    if (file.find(".sst") == string::npos)
+      continue;
+
+    cout << "Checking " << file << "... " << std::flush;
+
+    // 导出SST到临时目录（使用索引避免命名冲突）
+    string temp_file = temp_dir + "/" + file + "." + stringify(file_index++);
+    BlueFS::FileReader* reader = nullptr;
+    r = bluefs->open_for_read("db", file, &reader);
+    if (r < 0) {
+      cout << "FAILED (cannot open from BlueFS)" << std::endl;
+      corrupted_files.push_back(file);
+      continue;
+    }
+
+    uint64_t size = reader->file->fnode.size;
+
+    // 检查文件大小是否合理，避免 OOM
+    const uint64_t MAX_SST_SIZE = 1ULL * 1024 * 1024 * 1024;  // 1GB
+    if (size > MAX_SST_SIZE) {
+      cout << "SKIPPED (file too large: " << byte_u_t(size) << ")" << std::endl;
+      delete reader;
+      continue;
+    }
+
+    bufferlist bl;
+    r = bluefs->read(reader, &reader->buf, 0, size, &bl, nullptr);
+    delete reader;
+
+    if (r < 0) {
+      cout << "FAILED (BlueFS read error)" << std::endl;
+      corrupted_files.push_back(file);
+      continue;
+    }
+
+    // 写入临时文件
+    int fd = ::open(temp_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+      cout << "FAILED (cannot create temp file)" << std::endl;
+      continue;
+    }
+    r = bl.write_fd(fd);
+    ::close(fd);
+
+    if (r < 0) {
+      cout << "FAILED (write temp file error)" << std::endl;
+      ::unlink(temp_file.c_str());
+      continue;
+    }
+
+    // 使用RocksDB SstFileReader验证checksum
+    rocksdb::Options opts;
+    rocksdb::SstFileReader sst_reader(opts);
+    rocksdb::Status status = sst_reader.Open(temp_file);
+
+    if (!status.ok()) {
+      cout << "CORRUPTED (cannot open: " << status.ToString() << ")" << std::endl;
+      corrupted_files.push_back(file);
+      ::unlink(temp_file.c_str());
+      continue;
+    }
+
+    // 遍历验证所有数据块的checksum
+    rocksdb::ReadOptions ropts;
+    ropts.verify_checksums = true;  // 强制验证checksum
+    std::unique_ptr<rocksdb::Iterator> it(sst_reader.NewIterator(ropts));
+
+    bool is_corrupted = false;
+    it->SeekToFirst();
+    while (it->Valid()) {
+      it->Next();
+      if (!it->status().ok()) {
+        is_corrupted = true;
+        break;
+      }
+    }
+
+    if (!it->status().ok() || is_corrupted) {
+      cout << "CORRUPTED (checksum error: " << it->status().ToString() << ")" << std::endl;
+      corrupted_files.push_back(file);
+    } else {
+      cout << "OK" << std::endl;
+    }
+
+    ::unlink(temp_file.c_str());
+  }
+
+  // 清理临时目录（使用 rm -rf 安全清理）
+  vector<string> rm_args = {"rm", "-rf", temp_dir};
+  if (safe_exec(rm_args) != 0) {
+    cerr << "Warning: Failed to cleanup temp directory: " << temp_dir << std::endl;
+  }
+
+  if (corrupted_files.empty()) {
+    cout << "\nNo corrupted SST files found" << std::endl;
+  } else {
+    cout << "\nFound " << corrupted_files.size() << " corrupted SST file(s):" << std::endl;
+    for (const auto& f : corrupted_files) {
+      cout << "  - " << f << std::endl;
+    }
+  }
+
+  return 0;
+}
+
+// 导出BlueFS中的SST文件到本地
+int export_bluefs_file(BlueFS* bluefs, const string& filename, const string& output_path)
+{
+  BlueFS::FileReader* reader = nullptr;
+  int r = bluefs->open_for_read("db", filename, &reader);
+  if (r < 0) {
+    cerr << "Failed to open " << filename << ": " << cpp_strerror(r) << std::endl;
+    return r;
+  }
+
+  uint64_t size = reader->file->fnode.size;
+  bufferlist bl;
+  r = bluefs->read(reader, &reader->buf, 0, size, &bl, nullptr);
+  delete reader;
+
+  if (r < 0) {
+    cerr << "Failed to read " << filename << ": " << cpp_strerror(r) << std::endl;
+    return r;
+  }
+
+  // 写入本地文件
+  int fd = ::open(output_path.c_str(), O_WRONLY|O_CREAT|O_TRUNC, 0644);
+  if (fd < 0) {
+    r = -errno;
+    cerr << "Failed to create " << output_path << ": " << cpp_strerror(r) << std::endl;
+    return r;
+  }
+
+  r = bl.write_fd(fd);
+  ::close(fd);
+
+  if (r < 0) {
+    cerr << "Failed to write to " << output_path << ": " << cpp_strerror(r) << std::endl;
+    return r;
+  }
+
+  if (debug) {
+    cout << "Exported " << filename << " (" << size << " bytes) to " << output_path << std::endl;
+  }
+
+  return 0;
+}
+
+// 导入本地文件到BlueFS
+int import_bluefs_file(BlueFS* bluefs, const string& local_path, const string& target_name)
+{
+  // 读取本地文件
+  bufferlist bl;
+  string error;
+  int r = bl.read_file(local_path.c_str(), &error);
+  if (r < 0) {
+    cerr << "Failed to read " << local_path << ": " << error << std::endl;
+    return r;
+  }
+
+  // 写入BlueFS
+  BlueFS::FileWriter* writer = nullptr;
+  r = bluefs->open_for_write("db", target_name, &writer, false);
+  if (r < 0) {
+    cerr << "Failed to open for write " << target_name << ": " << cpp_strerror(r) << std::endl;
+    return r;
+  }
+
+  writer->append(bl);
+  r = bluefs->fsync(writer);
+  if (r < 0) {
+    cerr << "Failed to sync " << target_name << ": " << cpp_strerror(r) << std::endl;
+    bluefs->close_writer(writer);
+
+    // 尝试删除失败的部分写入文件
+    int unlink_ret = bluefs->unlink("db", target_name);
+    if (unlink_ret < 0 && debug) {
+      cerr << "Warning: Failed to cleanup partial file: " << cpp_strerror(unlink_ret) << std::endl;
+    }
+
+    return r;
+  }
+
+  bluefs->close_writer(writer);
+
+  if (debug) {
+    cout << "Imported " << local_path << " (" << bl.length() << " bytes) as " << target_name << std::endl;
+  }
+
+  return 0;
+}
+
+// 使用RocksDB API修复损坏的SST文件
+// 参考RocksDB PR #6955的实现：读取有效数据块，跳过损坏块，重建SST
+int repair_sst_file(const string& input_path, const string& output_path)
+{
+  if (debug) {
+    cout << "Repairing SST file using RocksDB API: " << input_path << std::endl;
+  }
+
+  // 打开损坏的SST文件读取
+  rocksdb::Options opts;
+  rocksdb::SstFileReader reader(opts);
+  rocksdb::Status status = reader.Open(input_path);
+
+  if (!status.ok()) {
+    cerr << "Cannot open SST file " << input_path << ": " << status.ToString() << std::endl;
+    return -EIO;
+  }
+
+  // 创建新的SST文件写入器
+  rocksdb::EnvOptions env_opts;
+  rocksdb::Options write_opts;
+
+  // 从原SST获取压缩算法
+  std::shared_ptr<const rocksdb::TableProperties> table_props = reader.GetTableProperties();
+  rocksdb::CompressionType compression = rocksdb::kLZ4Compression;  // 默认LZ4
+
+  if (table_props) {
+    // 解析压缩类型
+    string compression_name = table_props->compression_name;
+    if (compression_name == "Snappy") {
+      compression = rocksdb::kSnappyCompression;
+    } else if (compression_name == "LZ4" || compression_name == "LZ4HC") {
+      compression = rocksdb::kLZ4Compression;
+    } else if (compression_name == "ZSTD") {
+      compression = rocksdb::kZSTD;
+    } else if (compression_name == "Zlib") {
+      compression = rocksdb::kZlibCompression;
+    }
+
+    if (debug) {
+      cout << "  Original SST compression: " << compression_name << std::endl;
+    }
+  }
+
+  write_opts.compression = compression;
+
+  rocksdb::SstFileWriter writer(env_opts, write_opts);
+  status = writer.Open(output_path);
+  if (!status.ok()) {
+    cerr << "Cannot create output SST file " << output_path << ": " << status.ToString() << std::endl;
+    return -EIO;
+  }
+
+  // 读取并复制有效的key-value对
+  rocksdb::ReadOptions ropts;
+  ropts.verify_checksums = false;  // 关闭checksum验证，允许读取部分损坏的数据
+  std::unique_ptr<rocksdb::Iterator> it(reader.NewIterator(ropts));
+
+  uint64_t valid_keys = 0;
+  uint64_t skipped_keys = 0;
+
+  it->SeekToFirst();
+  while (it->Valid()) {
+    // 尝试读取key和value
+    rocksdb::Slice key = it->key();
+    rocksdb::Slice value = it->value();
+
+    // 写入新的SST文件
+    status = writer.Put(key, value);
+    if (!status.ok()) {
+      if (debug) {
+        cerr << "Failed to write key: " << status.ToString() << std::endl;
+      }
+      skipped_keys++;
+    } else {
+      valid_keys++;
+    }
+
+    // 移动到下一个key
+    it->Next();
+  }
+
+  // 检查iterator状态
+  if (!it->status().ok()) {
+    if (it->status().IsCorruption()) {
+      cerr << "Warning: Corruption detected during iteration: " << it->status().ToString() << std::endl;
+    } else {
+      // 非corruption错误，属于严重问题
+      cerr << "Iterator error: " << it->status().ToString() << std::endl;
+      ::unlink(output_path.c_str());
+      return -EIO;
+    }
+  }
+
+  // 完成写入
+  status = writer.Finish();
+  if (!status.ok()) {
+    cerr << "Failed to finish SST file: " << status.ToString() << std::endl;
+    ::unlink(output_path.c_str());
+    return -EIO;
+  }
+
+  // 如果一个有效key都没有，认为修复失败
+  if (valid_keys == 0) {
+    cerr << "ERROR: No valid keys found in SST file" << std::endl;
+    ::unlink(output_path.c_str());
+    return -ENODATA;
+  }
+
+  // 报告修复结果
+  uint64_t total_keys = valid_keys + skipped_keys;
+  if (skipped_keys > 0) {
+    double loss_ratio = (double)skipped_keys / total_keys;
+    cout << "    Repaired keys: " << valid_keys << " / " << total_keys;
+    cout << " (" << std::fixed << std::setprecision(1) << (loss_ratio * 100) << "% lost)" << std::endl;
+
+    if (loss_ratio > 0.5) {
+      cerr << "    WARNING: More than 50% data loss!" << std::endl;
+      cerr << "    Consider using backup instead of repaired file." << std::endl;
+    }
+  } else {
+    cout << "    All " << valid_keys << " keys successfully recovered" << std::endl;
+  }
+
+  if (debug) {
+    cout << "  Valid keys copied: " << valid_keys << std::endl;
+    cout << "  Skipped keys: " << skipped_keys << std::endl;
+  }
+
+  return 0;
+}
+
+// 自动修复所有损坏的RocksDB SST文件
+int auto_repair_rocksdb(ObjectStore *store, const string& temp_dir, bool keep_corrupted, bool dry_run)
+{
+  cout << "=== RocksDB Auto Repair ===" << std::endl;
+  if (dry_run) {
+    cout << "*** DRY-RUN MODE - No changes will be made ***" << std::endl;
+  }
+  cout << std::endl;
+
+  BlueStore* bstore = dynamic_cast<BlueStore*>(store);
+  if (!bstore) {
+    cerr << "This operation only works with BlueStore" << std::endl;
+    return -EINVAL;
+  }
+
+  BlueFS* bluefs = bstore->bluefs;
+  if (!bluefs) {
+    cerr << "BlueFS not available" << std::endl;
+    return -ENODEV;
+  }
+
+  // 1. 扫描损坏的SST文件
+  cout << "Step 1: Scanning for corrupted SST files..." << std::endl;
+  vector<string> corrupted_files;
+  int r = scan_rocksdb_corruption(store, corrupted_files);
+  if (r < 0) {
+    return r;
+  }
+
+  if (corrupted_files.empty()) {
+    cout << "No corrupted files found. Nothing to repair." << std::endl;
+    return 0;
+  }
+
+  cout << std::endl;
+
+  // 2. 创建临时目录
+  cout << "Step 2: Preparing temporary directory..." << std::endl;
+  string work_dir = temp_dir + "/rocksdb_repair_" + stringify(getpid());
+  if (::mkdir(work_dir.c_str(), 0755) != 0 && errno != EEXIST) {
+    cerr << "Failed to create temp directory " << work_dir << ": " << cpp_strerror(errno) << std::endl;
+    return -errno;
+  }
+  cout << "Working directory: " << work_dir << std::endl << std::endl;
+
+  // 3. 处理每个损坏的文件
+  int repaired_count = 0;
+  int failed_count = 0;
+
+  for (const auto& sst_file : corrupted_files) {
+    cout << "Step 3." << (repaired_count + failed_count + 1) << ": Processing " << sst_file << "..." << std::endl;
+
+    string corrupted_path = work_dir + "/" + sst_file + ".corrupted";
+    string repaired_path = work_dir + "/" + sst_file + ".repaired";
+
+    // 3.1 导出损坏的文件
+    cout << "  - Exporting corrupted file..." << std::endl;
+    r = export_bluefs_file(bluefs, sst_file, corrupted_path);
+    if (r < 0) {
+      cerr << "  ERROR: Failed to export, skipping" << std::endl;
+      failed_count++;
+      continue;
+    }
+
+    // 3.2 修复文件（使用RocksDB API）
+    cout << "  - Repairing SST file using RocksDB API..." << std::endl;
+    r = repair_sst_file(corrupted_path, repaired_path);
+    if (r < 0) {
+      cerr << "  ERROR: Failed to repair, skipping" << std::endl;
+      failed_count++;
+      continue;
+    }
+
+    // 3.3 备份原文件（如果需要）
+    if (keep_corrupted) {
+      cout << "  - Backing up original file..." << std::endl;
+      string backup_name;
+      int rename_ret = -1;
+      for (int attempt = 0; attempt < 5; ++attempt) {
+        backup_name = sst_file + ".backup." +
+                      stringify(getpid()) + "." +
+                      stringify(static_cast<long long>(time(nullptr))) + "." +
+                      stringify(attempt);
+        rename_ret = bluefs->rename("db", sst_file, "db", backup_name);
+        if (rename_ret == 0) {
+          break;
+        }
+        if (rename_ret != -EEXIST) {
+          break;
+        }
+      }
+      if (rename_ret < 0) {
+        cerr << "  ERROR: Failed to backup original file: " << cpp_strerror(rename_ret) << std::endl;
+        failed_count++;
+        continue;
+      }
+      cout << "    Original saved as " << backup_name << std::endl;
+    }
+
+    // 3.4 导入修复后的文件
+    if (dry_run) {
+      cout << "  - [DRY-RUN] Would import repaired file" << std::endl;
+    } else {
+      cout << "  - Importing repaired file..." << std::endl;
+      r = import_bluefs_file(bluefs, repaired_path, sst_file);
+      if (r < 0) {
+        cerr << "  ERROR: Failed to import, skipping" << std::endl;
+        failed_count++;
+        continue;
+      }
+    }
+
+    cout << "  ✓ Successfully repaired" << std::endl;
+    repaired_count++;
+  }
+
+  cout << std::endl;
+
+  // 4. 同步 BlueFS 到磁盘
+  if (repaired_count > 0 && !dry_run) {
+    cout << "Step 4: Syncing BlueFS to disk..." << std::endl;
+
+    try {
+      bluefs->sync_metadata(false);
+      cout << "  ✓ BlueFS synced successfully" << std::endl;
+    } catch (const std::exception& e) {
+      cerr << "ERROR: Failed to sync BlueFS metadata: " << e.what() << std::endl;
+      return -EIO;
+    }
+
+    cout << std::endl;
+  }
+
+  // 5. 清理临时文件
+  if (!keep_corrupted) {
+    cout << "Step 5: Cleaning up temporary files..." << std::endl;
+    // 安全方式清理目录
+    vector<string> rm_args = {"rm", "-rf", work_dir};
+    int cleanup_ret = safe_exec(rm_args);
+    if (cleanup_ret != 0) {
+      cerr << "Warning: Failed to cleanup temporary directory: " << work_dir << std::endl;
+    }
+  } else {
+    cout << "Step 5: Temporary files kept in " << work_dir << std::endl;
+  }
+
+  cout << std::endl;
+
+  // 6. 生成报告
+  cout << "=== Repair Summary ===" << std::endl;
+  cout << "Total corrupted files: " << corrupted_files.size() << std::endl;
+  cout << "Successfully repaired: " << repaired_count << std::endl;
+  cout << "Failed to repair: " << failed_count << std::endl;
+
+  if (repaired_count > 0) {
+    cout << std::endl;
+    cout << "IMPORTANT: Please restart the OSD to verify the repair." << std::endl;
+    cout << "Monitor OSD logs for any RocksDB errors." << std::endl;
+  }
+
+  return (repaired_count > 0) ? 0 : -EIO;
+}
+
+// 分析磁盘使用情况
+int analyze_disk_usage(ObjectStore *store)
+{
+  cout << "=== Disk Usage Analysis ===" << std::endl << std::endl;
+
+  BlueStore* bstore = dynamic_cast<BlueStore*>(store);
+  if (!bstore) {
+    cerr << "This operation only works with BlueStore" << std::endl;
+    return -EINVAL;
+  }
+
+  BlueFS* bluefs = bstore->bluefs;
+  if (!bluefs) {
+    cerr << "BlueFS not available" << std::endl;
+    return -ENODEV;
+  }
+
+  // 获取BlueFS空间使用
+  uint64_t total, used;
+  bluefs_get_usage_nautilus(bluefs, &total, &used);
+  double usage_pct = total > 0 ? (double)used / total * 100.0 : 0;
+
+  cout << "BlueFS Usage:" << std::endl;
+  cout << "  Total: " << byte_u_t(total) << std::endl;
+  cout << "  Used: " << byte_u_t(used) << std::endl;
+  cout << "  Free: " << byte_u_t(total - used) << std::endl;
+  cout << "  Usage: " << fixed << setprecision(2) << usage_pct << "%" << std::endl;
+
+  if (usage_pct >= DISK_FULL_THRESHOLD) {
+    cout << "\n⚠️  WARNING: Disk is critically full!" << std::endl;
+    cout << "  OSD may fail to start due to insufficient space." << std::endl;
+    cout << "  Recommended action: run 'recover-full-disk' operation" << std::endl;
+  }
+
+  // 列出db目录文件
+  vector<string> files;
+  int r = bluefs->readdir("db", &files);
+  if (r < 0) {
+    cerr << "Failed to read db directory" << std::endl;
+    return r;
+  }
+
+  // 统计文件类型
+  uint64_t sst_size = 0, wal_size = 0, manifest_size = 0, other_size = 0;
+  int sst_count = 0, wal_count = 0;
+
+  for (const auto& file : files) {
+    uint64_t size = 0;
+    r = bluefs->stat("db", file, &size, nullptr);
+    if (r < 0) {
+      continue;
+    }
+
+    if (file.find(".sst") != string::npos) {
+      sst_size += size;
+      sst_count++;
+    } else if (file.find(".log") != string::npos && file.find("MANIFEST") == string::npos) {
+      wal_size += size;
+      wal_count++;
+    } else if (file.find("MANIFEST") != string::npos) {
+      manifest_size += size;
+    } else {
+      other_size += size;
+    }
+  }
+
+  // 单独统计db.wal目录（若存在）
+  vector<string> wal_dir_files;
+  int wal_dir_ret = bluefs->readdir("db.wal", &wal_dir_files);
+  if (wal_dir_ret == 0) {
+    for (const auto& file : wal_dir_files) {
+      uint64_t size = 0;
+      int sr = bluefs->stat("db.wal", file, &size, nullptr);
+      if (sr < 0) {
+        continue;
+      }
+
+      if (file.find(".log") != string::npos && file.find("MANIFEST") == string::npos) {
+        wal_size += size;
+        wal_count++;
+      } else if (file.find("MANIFEST") != string::npos) {
+        manifest_size += size;
+      } else {
+        other_size += size;
+      }
+    }
+  } else if (wal_dir_ret < 0 && wal_dir_ret != -ENOENT) {
+    cerr << "Failed to read db.wal directory: " << cpp_strerror(wal_dir_ret) << std::endl;
+    return wal_dir_ret;
+  }
+
+  cout << "\nRocksDB Files:" << std::endl;
+  cout << "  SST files: " << sst_count << " (" << byte_u_t(sst_size) << ")" << std::endl;
+  cout << "  WAL files: " << wal_count << " (" << byte_u_t(wal_size) << ")" << std::endl;
+  cout << "  MANIFEST: " << byte_u_t(manifest_size) << std::endl;
+  cout << "  Other: " << byte_u_t(other_size) << std::endl;
+
+  cout << "\nSpace Recovery Potential:" << std::endl;
+  if (sst_count > 10) {
+    cout << "  RocksDB Compaction: ~" << byte_u_t(sst_size * 0.3) << " - " << byte_u_t(sst_size * 0.7) << std::endl;
+  }
+  if (wal_size > 0) {
+    cout << "  WAL Cleanup: ~" << byte_u_t(wal_size * 0.5) << std::endl;
+  }
+
+  return 0;
+}
+
+// 列出WAL文件（不需要启动RocksDB）
+int list_wal_files(ObjectStore *store)
+{
+  cout << "=== WAL Files Analysis ===" << std::endl << std::endl;
+
+  BlueStore* bstore = dynamic_cast<BlueStore*>(store);
+  if (!bstore) {
+    cerr << "This operation only works with BlueStore" << std::endl;
+    return -EINVAL;
+  }
+
+  BlueFS* bluefs = bstore->bluefs;
+  if (!bluefs) {
+    cerr << "BlueFS not available" << std::endl;
+    return -ENODEV;
+  }
+
+  vector<pair<uint64_t, string>> wal_files;
+  string wal_dir;
+  int r = collect_bluefs_wal_files(bluefs, &wal_files, &wal_dir);
+  if (r == -ENOENT) {
+    cout << "No WAL directory (db.wal or db) found" << std::endl;
+    return 0;
+  }
+  if (r < 0) {
+    cerr << "Failed to enumerate WAL directory: " << cpp_strerror(r) << std::endl;
+    return r;
+  }
+
+  if (wal_files.empty()) {
+    cout << "No WAL files found in " << wal_dir << std::endl;
+    return 0;
+  }
+
+  cout << "Found " << wal_files.size() << " WAL file(s) in " << wal_dir << ":" << std::endl << std::endl;
+
+  uint64_t total_size = 0;
+  cout << setw(12) << "Log Number" << "  " << setw(20) << "Filename" << "  " << setw(15) << "Size" << std::endl;
+  cout << string(50, '-') << std::endl;
+
+  for (const auto& [log_num, filename] : wal_files) {
+    uint64_t size = 0;
+    r = bluefs->stat(wal_dir, filename, &size, nullptr);
+    if (r < 0) {
+      cerr << "Warning: failed to stat " << wal_dir << "/" << filename
+           << ": " << cpp_strerror(r) << std::endl;
+      continue;
+    }
+
+    cout << setw(12) << log_num << "  "
+         << setw(20) << filename << "  "
+         << setw(15) << byte_u_t(size) << std::endl;
+
+    total_size += size;
+  }
+
+  cout << string(50, '-') << std::endl;
+  cout << "Total WAL size: " << byte_u_t(total_size) << std::endl;
+
+  // 显示建议
+  if (wal_files.size() > 1) {
+    cout << "\nℹ️  Note: Multiple WAL files detected" << std::endl;
+    cout << "  - Latest WAL (highest number): " << wal_files.back().second << " - ACTIVE, cannot delete" << std::endl;
+    cout << "  - Older WALs: May be safe to delete if data is flushed to SST" << std::endl;
+    cout << "  - Use 'clean-old-wal' operation to safely delete old WALs from " << wal_dir << std::endl;
+  }
+
+  return 0;
+}
+
+// 清理旧的WAL文件（不需要启动RocksDB）
+int clean_old_wal(ObjectStore *store, bool force, bool dry_run)
+{
+  cout << "=== Clean Old WAL Files ===" << std::endl;
+  if (dry_run) {
+    cout << "*** DRY-RUN MODE ***" << std::endl;
+  }
+  cout << std::endl;
+
+  BlueStore* bstore = dynamic_cast<BlueStore*>(store);
+  if (!bstore) {
+    cerr << "This operation only works with BlueStore" << std::endl;
+    return -EINVAL;
+  }
+
+  BlueFS* bluefs = bstore->bluefs;
+  if (!bluefs) {
+    cerr << "BlueFS not available" << std::endl;
+    return -ENODEV;
+  }
+
+  vector<pair<uint64_t, string>> wal_files;
+  string wal_dir;
+  int r = collect_bluefs_wal_files(bluefs, &wal_files, &wal_dir);
+  if (r == -ENOENT) {
+    cout << "No WAL directory (db.wal or db) found" << std::endl;
+    return 0;
+  }
+  if (r < 0) {
+    cerr << "Failed to enumerate WAL directory: " << cpp_strerror(r) << std::endl;
+    return r;
+  }
+
+  if (wal_files.empty()) {
+    cout << "No WAL files found in " << wal_dir << std::endl;
+    return 0;
+  }
+
+  if (wal_files.size() == 1) {
+    cout << "Only one WAL file found in " << wal_dir << ": " << wal_files[0].second << std::endl;
+    cout << "This is the active WAL, cannot delete" << std::endl;
+    return 0;
+  }
+
+  // 最后一个WAL是active的，不能删除
+  uint64_t active_log = wal_files.back().first;
+  string active_file = wal_files.back().second;
+
+  cout << "Active WAL (will be kept): " << active_file << " (log " << active_log << ")" << std::endl;
+  cout << "\nOld WAL files to delete:" << std::endl;
+
+  uint64_t total_freed = 0;
+  int deleted_count = 0;
+
+  for (size_t i = 0; i < wal_files.size() - 1; i++) {
+    const auto& [log_num, filename] = wal_files[i];
+
+    uint64_t size = 0;
+    r = bluefs->stat(wal_dir, filename, &size, nullptr);
+    if (r < 0) {
+      cerr << "Warning: failed to stat " << wal_dir << "/" << filename
+           << ": " << cpp_strerror(r) << std::endl;
+      continue;
+    }
+
+    cout << "  " << filename << " (log " << log_num << ", " << byte_u_t(size) << ")";
+
+    if (!dry_run) {
+      r = bluefs->unlink(wal_dir, filename);
+      if (r < 0) {
+        cout << " - FAILED: " << cpp_strerror(r) << std::endl;
+      } else {
+        cout << " - deleted" << std::endl;
+        total_freed += size;
+        deleted_count++;
+      }
+    } else {
+      cout << " - [DRY-RUN] would delete" << std::endl;
+      total_freed += size;
+      deleted_count++;
+    }
+  }
+
+  cout << "\n=== Summary ===" << std::endl;
+  cout << "Directory: " << wal_dir << std::endl;
+  cout << "Total WAL files: " << wal_files.size() << std::endl;
+  cout << "Deleted: " << deleted_count << std::endl;
+  cout << "Kept (active): 1" << std::endl;
+  if (!dry_run) {
+    cout << "Space freed: " << byte_u_t(total_freed) << std::endl;
+  } else {
+    cout << "Space would be freed: " << byte_u_t(total_freed) << std::endl;
+  }
+
+  if (!force && deleted_count > 0 && !dry_run) {
+    cout << "\n⚠️  WARNING: Old WAL files deleted" << std::endl;
+    cout << "  - If RocksDB did not properly flush data to SST, some recent writes may be lost" << std::endl;
+    cout << "  - This is usually safe if OSD was shut down cleanly" << std::endl;
+    cout << "  - Use with caution in crash scenarios" << std::endl;
+  }
+
+  return 0;
+}
+
+// 离线压缩RocksDB
+int compact_rocksdb_offline(ObjectStore *store, bool force)
+{
+  cout << "=== RocksDB Offline Compaction ===" << std::endl << std::endl;
+
+  BlueStore* bstore = dynamic_cast<BlueStore*>(store);
+  if (!bstore) {
+    cerr << "This operation only works with BlueStore" << std::endl;
+    return -EINVAL;
+  }
+
+  BlueFS* bluefs = bstore->bluefs;
+  if (!bluefs) {
+    cerr << "BlueFS not available" << std::endl;
+    return -ENODEV;
+  }
+
+  // 获取压缩前的空间
+  uint64_t before_total, before_used;
+  bluefs_get_usage_nautilus(bluefs, &before_total, &before_used);
+
+  cout << "Before compaction:" << std::endl;
+  cout << "  Total: " << byte_u_t(before_total) << std::endl;
+  cout << "  Used: " << byte_u_t(before_used) << std::endl;
+  cout << "  Usage: " << fixed << setprecision(2)
+       << ((double)before_used / before_total * 100.0) << "%" << std::endl;
+
+  // 使用已经打开的RocksDB实例执行压缩
+  cout << "\nOpening RocksDB..." << std::endl;
+  RocksDBStore* rocksdb_store = nullptr;
+  if (bstore->db) {
+    rocksdb_store = dynamic_cast<RocksDBStore*>(bstore->db);
+  }
+  if (!rocksdb_store) {
+    cerr << "RocksDB instance unavailable (is the store mounted as BlueStore?)" << std::endl;
+    return -EINVAL;
+  }
+
+  // 执行完整compaction
+  cout << "Running full compaction..." << std::endl;
+  cout << "  (This may take several minutes, please wait)" << std::endl;
+
+  try {
+    rocksdb_store->compact();  // 全范围compaction
+  } catch (const std::exception& e) {
+    cerr << "Compaction failed: " << e.what() << std::endl;
+    return -EIO;
+  }
+
+  cout << "Compaction completed" << std::endl;
+
+  // 获取压缩后的空间
+  uint64_t after_total, after_used;
+  bluefs_get_usage_nautilus(bluefs, &after_total, &after_used);
+
+  cout << "\nAfter compaction:" << std::endl;
+  cout << "  Total: " << byte_u_t(after_total) << std::endl;
+  cout << "  Used: " << byte_u_t(after_used) << std::endl;
+  cout << "  Usage: " << fixed << setprecision(2)
+       << ((double)after_used / after_total * 100.0) << "%" << std::endl;
+
+  if (before_used > after_used) {
+    cout << "\n✓ SUCCESS: Freed " << byte_u_t(before_used - after_used) << std::endl;
+  } else {
+    cout << "\nNote: No space was freed (DB may already be compact)" << std::endl;
+  }
+
+  return 0;
+}
+
+// 自动修复磁盘满问题（不依赖RocksDB启动）
+int recover_full_disk(ObjectStore *store, bool aggressive, bool dry_run)
+{
+  cout << "=== OSD Full Disk Recovery ===" << std::endl;
+  if (dry_run) {
+    cout << "*** DRY-RUN MODE ***" << std::endl;
+  }
+  cout << std::endl;
+
+  BlueStore* bstore = dynamic_cast<BlueStore*>(store);
+  if (!bstore) {
+    cerr << "This operation only works with BlueStore" << std::endl;
+    return -EINVAL;
+  }
+
+  BlueFS* bluefs = bstore->bluefs;
+  if (!bluefs) {
+    cerr << "BlueFS not available" << std::endl;
+    return -ENODEV;
+  }
+
+  // 1. 检查初始空间
+  uint64_t initial_total, initial_used;
+  bluefs_get_usage_nautilus(bluefs, &initial_total, &initial_used);
+  double initial_pct = (double)initial_used / initial_total * 100.0;
+
+  cout << "Initial disk usage: " << fixed << setprecision(2)
+       << initial_pct << "%" << std::endl;
+
+  if (initial_pct < DISK_FULL_THRESHOLD) {
+    cout << "Disk not critically full, recovery may not be necessary" << std::endl;
+    cout << "Current usage is acceptable for OSD startup" << std::endl;
+    return 0;
+  }
+
+  cout << "⚠️  Disk is critically full, proceeding with recovery..." << std::endl;
+  cout << "\nℹ️  Strategy: Clean old WAL files (does NOT require RocksDB to start)" << std::endl << std::endl;
+
+  // 2. 清理旧的WAL文件（不需要启动RocksDB）
+  cout << "Step 1: Clean Old WAL Files" << std::endl;
+  cout << "----------------------------------------" << std::endl;
+
+  int r = clean_old_wal(store, true, dry_run);  // force=true
+  if (r < 0) {
+    cerr << "Warning: WAL cleanup failed: " << cpp_strerror(r) << std::endl;
+  }
+
+  // 3. 检查清理后的空间
+  uint64_t after_total, after_used;
+  bluefs_get_usage_nautilus(bluefs, &after_total, &after_used);
+  double after_pct = (double)after_used / after_total * 100.0;
+
+  cout << "\nStep 2: Space Analysis" << std::endl;
+  cout << "----------------------------------------" << std::endl;
+  cout << "Usage after cleanup: " << fixed << setprecision(2)
+       << after_pct << "%" << std::endl;
+
+  // 4. 如果开启aggressive模式且空间仍不够，尝试compaction
+  if (aggressive && after_pct >= DISK_FULL_THRESHOLD && !dry_run) {
+    cout << "\n[Aggressive Mode] Attempting RocksDB Compaction..." << std::endl;
+    cout << "⚠️  Note: This requires RocksDB to start, may fail if disk is 100% full" << std::endl;
+
+    r = compact_rocksdb_offline(store, true);
+    if (r == 0) {
+      bluefs_get_usage_nautilus(bluefs, &after_total, &after_used);
+      after_pct = (double)after_used / after_total * 100.0;
+      cout << "Usage after compaction: " << fixed << setprecision(2)
+           << after_pct << "%" << std::endl;
+    } else {
+      cerr << "Compaction failed (this is expected if disk is 100% full)" << std::endl;
+    }
+  }
+
+  // 5. 生成报告
+  cout << "\n=== Recovery Summary ===" << std::endl;
+  cout << "Initial usage: " << fixed << setprecision(2) << initial_pct << "%" << std::endl;
+  cout << "Final usage: " << fixed << setprecision(2) << after_pct << "%" << std::endl;
+
+  if (initial_used > after_used) {
+    cout << "Space freed: " << byte_u_t(initial_used - after_used)
+         << " (" << fixed << setprecision(2) << (initial_pct - after_pct) << "%)" << std::endl;
+  }
+
+  if (after_pct < DISK_FULL_THRESHOLD) {
+    cout << "\n✓ SUCCESS: Disk now has sufficient space" << std::endl;
+    cout << "  OSD should be able to start normally" << std::endl;
+    return 0;
+  } else {
+    cout << "\n⚠️  WARNING: Disk still critically full" << std::endl;
+    cout << "  OSD may still fail to start due to insufficient space" << std::endl;
+    cout << "\nRecommended actions:" << std::endl;
+    cout << "1. Run 'clean-old-wal --force' to delete old WAL files" << std::endl;
+    cout << "2. Expand BlueFS space from slow device (if available)" << std::endl;
+    cout << "3. Mount external temporary space and use as RocksDB temp dir" << std::endl;
+    cout << "4. Increase disk size or migrate to larger disk" << std::endl;
+    return -ENOSPC;
+  }
 }
 
 int get_pg_num_history(ObjectStore *store, pool_pg_num_history_t *h)
@@ -3076,9 +4667,12 @@ int main(int argc, char **argv)
      "Pool name, mandatory for apply-layout-settings if --pgid is not specified")
     ("op", po::value<string>(&op),
      "Arg is one of [info, log, remove, mkfs, fsck, repair, fuse, dup, export, export-remove, import, list, fix-lost, list-pgs, dump-journal, dump-super, meta-list, "
-     "get-osdmap, set-osdmap, get-inc-osdmap, set-inc-osdmap, mark-complete, reset-last-complete, apply-layout-settings, update-mon-db, dump-export, trim-pg-log, statfs]")
+     "get-osdmap, set-osdmap, get-inc-osdmap, set-inc-osdmap, fetch-osdmaps, repair-superblock, scan-rocksdb-corruption, auto-repair-rocksdb, "
+     "analyze-disk-usage, list-wal-files, clean-old-wal, compact-rocksdb, recover-full-disk, mark-complete, reset-last-complete, apply-layout-settings, update-mon-db, dump-export, trim-pg-log, statfs]")
     ("epoch", po::value<unsigned>(&epoch),
-     "epoch# for get-osdmap and get-inc-osdmap, the current epoch in use if not specified")
+     "epoch# for get-osdmap, get-inc-osdmap and fetch-osdmaps (start epoch), the current epoch in use if not specified")
+    ("epoch-end", po::value<unsigned>(),
+     "end epoch# for fetch-osdmaps, fetch from --epoch to --epoch-end (inclusive)")
     ("file", po::value<string>(&file),
      "path of file to export, export-remove, import, get-osdmap, set-osdmap, get-inc-osdmap or set-inc-osdmap")
     ("mon-store-path", po::value<string>(&mon_store_path),
@@ -3097,6 +4691,14 @@ int main(int argc, char **argv)
     ("skip-mount-omap", "Disable mounting of omap")
     ("head", "Find head/snapdir when searching for objects by name")
     ("dry-run", "Don't modify the objectstore")
+    ("full-osdmap", "For fetch-osdmaps: fetch full OSDMaps instead of incremental")
+    ("osd-id", po::value<int>(), "OSD ID for repair-superblock (required)")
+    ("cluster-fsid", po::value<string>(), "Cluster FSID for repair-superblock (required)")
+    ("osd-fsid", po::value<string>(), "OSD FSID for repair-superblock (optional: auto-detected from fsid file)")
+    ("current-epoch", po::value<unsigned>(), "Current cluster epoch for repair-superblock (optional: auto-detected from local OSDMaps or monitors)")
+    ("temp-dir", po::value<string>(), "Temporary directory for auto-repair-rocksdb (default: /tmp)")
+    ("keep-corrupted", "Keep corrupted SST files and repair logs for debugging (auto-repair-rocksdb)")
+    ("aggressive", "Aggressive mode for recover-full-disk: perform all cleanup operations")
     ("namespace", po::value<string>(&argnspace), "Specify namespace when searching for objects")
     ("rmtype", po::value<string>(&rmtypestr), "Specify corrupting object removal 'snapmap' or 'nosnapmap' - TESTING USE ONLY")
     ;
@@ -3435,6 +5037,64 @@ int main(int argc, char **argv)
     }
     return 0;
   }
+  if (op == "repair-superblock") {
+    // 重建损坏的superblock - 必须在mount之前执行！
+    cout << "=== OSD Superblock Repair ===" << std::endl;
+    cout << std::endl;
+
+    int32_t osd_id = -1;
+    string cluster_fsid_str;
+    string osd_fsid_str;
+    epoch_t current_epoch = 0;
+
+    // 获取OSD ID
+    if (vm.count("osd-id")) {
+      osd_id = vm["osd-id"].as<int>();
+    } else {
+      cerr << "Must specify --osd-id for repair-superblock" << std::endl;
+      return 1;
+    }
+
+    // 获取可选参数
+    if (vm.count("cluster-fsid")) {
+      cluster_fsid_str = vm["cluster-fsid"].as<string>();
+    }
+
+    if (vm.count("osd-fsid")) {
+      osd_fsid_str = vm["osd-fsid"].as<string>();
+    }
+
+    if (vm.count("current-epoch")) {
+      current_epoch = vm["current-epoch"].as<unsigned>();
+    }
+
+    // 先尝试mount以初始化BlueStore（只读模式，忽略错误）
+    // 这样可以让BlueStore加载fsid等基本信息
+    int mount_ret = fs->mount();
+    bool mounted = (mount_ret == 0);
+
+    if (!mounted) {
+      cout << "Note: ObjectStore mount failed (expected if superblock corrupted)" << std::endl;
+      cout << "      Proceeding with superblock rebuild anyway..." << std::endl;
+      cout << std::endl;
+    }
+
+    // 执行重建
+    int ret = rebuild_superblock(fs, dpath, osd_id, cluster_fsid_str, osd_fsid_str,
+                                 current_epoch, force, mounted);
+
+    // 如果mount成功了，需要umount
+    if (mounted) {
+      fs->umount();
+    }
+
+    if (ret < 0) {
+      cerr << "repair-superblock failed with error " << cpp_strerror(ret) << std::endl;
+      return 1;
+    }
+
+    return 0;
+  }
 
   int ret = fs->mount();
   if (ret < 0) {
@@ -3710,6 +5370,116 @@ int main(int argc, char **argv)
       ret = set_inc_osdmap(fs, epoch, bl, force);
     }
     goto out;
+  } else if (op == "fetch-osdmaps") {
+    // 从Monitor集群获取OSDMap并写入
+    epoch_t first_epoch = epoch;
+    epoch_t last_epoch = epoch;
+
+    if (first_epoch == 0) {
+      cerr << "Must specify --epoch for fetch-osdmaps" << std::endl;
+      usage(desc);
+      ret = -EINVAL;
+      goto out;
+    }
+
+    if (vm.count("epoch-end")) {
+      last_epoch = vm["epoch-end"].as<unsigned>();
+    }
+
+    if (first_epoch > last_epoch) {
+      cerr << "Invalid epoch range: " << first_epoch << " > " << last_epoch << std::endl;
+      ret = -EINVAL;
+      goto out;
+    }
+
+    // 检查是否获取完整OSDMap
+    bool get_full = vm.count("full-osdmap");
+
+    ret = fetch_osdmaps_from_mon(fs, first_epoch, last_epoch, get_full, force);
+    if (ret < 0) {
+      cerr << "fetch-osdmaps failed with error " << cpp_strerror(ret) << std::endl;
+    }
+    goto out;
+  } else if (op == "scan-rocksdb-corruption") {
+    // 扫描RocksDB损坏的SST文件
+    BlueStore* bstore = dynamic_cast<BlueStore*>(fs);
+    if (!bstore) {
+      cerr << "scan-rocksdb-corruption only works with BlueStore" << std::endl;
+      ret = -EINVAL;
+      goto out;
+    }
+
+    vector<string> corrupted_files;
+    ret = scan_rocksdb_corruption(bstore, corrupted_files);
+    if (ret < 0) {
+      cerr << "scan-rocksdb-corruption failed: " << cpp_strerror(ret) << std::endl;
+      goto out;
+    }
+
+    if (corrupted_files.empty()) {
+      cout << "No corrupted SST files found." << std::endl;
+    } else {
+      cout << "Found " << corrupted_files.size() << " corrupted SST file(s):" << std::endl;
+      for (const auto& file : corrupted_files) {
+        cout << "  " << file << std::endl;
+      }
+    }
+    goto out;
+  } else if (op == "auto-repair-rocksdb") {
+    // 自动修复RocksDB损坏的SST文件
+    BlueStore* bstore = dynamic_cast<BlueStore*>(fs);
+    if (!bstore) {
+      cerr << "auto-repair-rocksdb only works with BlueStore" << std::endl;
+      ret = -EINVAL;
+      goto out;
+    }
+
+    string temp_dir = "/tmp";
+    bool keep_corrupted = false;
+
+    if (vm.count("temp-dir")) {
+      temp_dir = vm["temp-dir"].as<string>();
+    }
+
+    if (vm.count("keep-corrupted")) {
+      keep_corrupted = true;
+    }
+
+    ret = auto_repair_rocksdb(bstore, temp_dir, keep_corrupted, dry_run);
+    if (ret < 0) {
+      cerr << "auto-repair-rocksdb failed: " << cpp_strerror(ret) << std::endl;
+    }
+    goto out;
+  } else if (op == "analyze-disk-usage") {
+    // 分析磁盘使用情况
+    ret = analyze_disk_usage(fs);
+    goto out;
+  } else if (op == "list-wal-files") {
+    // 列出WAL文件
+    ret = list_wal_files(fs);
+    goto out;
+  } else if (op == "clean-old-wal") {
+    // 清理旧的WAL文件
+    ret = clean_old_wal(fs, force, dry_run);
+    if (ret < 0) {
+      cerr << "clean-old-wal failed: " << cpp_strerror(ret) << std::endl;
+    }
+    goto out;
+  } else if (op == "compact-rocksdb") {
+    // 离线压缩RocksDB
+    ret = compact_rocksdb_offline(fs, force);
+    if (ret < 0) {
+      cerr << "compact-rocksdb failed: " << cpp_strerror(ret) << std::endl;
+    }
+    goto out;
+  } else if (op == "recover-full-disk") {
+    // 自动修复磁盘满问题
+    bool aggressive = vm.count("aggressive") > 0;
+    ret = recover_full_disk(fs, aggressive, dry_run);
+    if (ret < 0 && ret != -ENOSPC) {
+      cerr << "recover-full-disk failed: " << cpp_strerror(ret) << std::endl;
+    }
+    goto out;
   } else if (op == "update-mon-db") {
     if (!vm.count("mon-store-path")) {
       cerr << "Please specify the path to monitor db to update" << std::endl;
@@ -3834,8 +5604,8 @@ int main(int argc, char **argv)
   // If not an object command nor any of the ops handled below, then output this usage
   // before complaining about a bad pgid
   if (!vm.count("objcmd") && op != "export" && op != "export-remove" && op != "info" && op != "log" && op != "mark-complete" && op != "trim-pg-log") {
-    cerr << "Must provide --op (info, log, remove, mkfs, fsck, repair, export, export-remove, import, list, fix-lost, list-pgs, dump-journal, dump-super, meta-list, "
-      "get-osdmap, set-osdmap, get-inc-osdmap, set-inc-osdmap, mark-complete, reset-last-complete, dump-export, trim-pg-log, statfs)"
+    cerr << "Must provide --op (info, log, remove, mkfs, fsck, repair, fuse, dup, export, export-remove, import, list, fix-lost, list-pgs, dump-journal, dump-super, meta-list, "
+      "get-osdmap, set-osdmap, get-inc-osdmap, set-inc-osdmap, fetch-osdmaps, repair-superblock, mark-complete, reset-last-complete, apply-layout-settings, update-mon-db, dump-export, trim-pg-log, statfs)"
 	 << std::endl;
     usage(desc);
     ret = 1;
@@ -4246,4 +6016,50 @@ out:
   if (ret < 0)
     ret = 1;
   return ret;
+}
+// 获取BlueFS中的WAL文件列表，优先db.wal目录，返回文件名及对应目录
+static int collect_bluefs_wal_files(
+    BlueFS* bluefs,
+    vector<pair<uint64_t, string>>* wal_files,
+    string* wal_dir)
+{
+  ceph_assert(wal_files);
+  ceph_assert(wal_dir);
+  static const std::array<const char*, 2> candidate_dirs = {"db.wal", "db"};
+
+  for (const char* dir : candidate_dirs) {
+    vector<string> files;
+    int r = bluefs->readdir(dir, &files);
+    if (r == -ENOENT) {
+      continue;
+    }
+    if (r < 0) {
+      return r;
+    }
+
+    wal_files->clear();
+    *wal_dir = dir;
+    for (const auto& file : files) {
+      if (file.find(".log") == string::npos ||
+          file.find("MANIFEST") != string::npos) {
+        continue;
+      }
+      size_t dot_pos = file.find(".log");
+      if (dot_pos == string::npos) {
+        continue;
+      }
+      try {
+        uint64_t log_num = stoull(file.substr(0, dot_pos));
+        wal_files->emplace_back(log_num, file);
+      } catch (...) {
+        continue;
+      }
+    }
+    sort(wal_files->begin(), wal_files->end());
+    return 0;
+  }
+
+  wal_files->clear();
+  wal_dir->clear();
+  return -ENOENT;
 }
